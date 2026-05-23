@@ -38,3 +38,19 @@ Add `CURSOR_API_KEY` as a repo secret. Per the [Python SDK docs](https://cursor.
 The workflow checks out the consumer repo on the runner and runs a **local** SDK agent (`local=LocalAgentOptions(cwd=...)`). The agent executes on the GitHub Actions machine against that checkout — it is not a Cursor-hosted cloud VM (`cloud=CloudAgentOptions(...)`). You still use Cursor’s **Composer model over the API**; “local” only describes where the process runs.
 
 Optional env on the reusable workflow: `CURSOR_MODEL` (default `composer-2.5`), `CURSOR_MODEL_FAST` (default `"false"` for standard tier; set `"true"` for fast).
+
+## Local development
+
+Use [uv](https://docs.astral.sh/uv/) with a virtual environment — same approach as the GitHub Action. Create the venv once, then reuse it; don’t reinstall with `pip` on every run.
+
+```bash
+uv python install 3.12
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install cursor-sdk
+
+# smoke test (needs CURSOR_API_KEY)
+python .github/scripts/smoke_test.py
+```
+
+The workflow uses `setup-uv` and `uv venv` + `uv pip install cursor-sdk` on the runner.
