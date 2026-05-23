@@ -32,6 +32,9 @@ import asyncio
 import os
 import sys
 import logging
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
 
 from cursor_sdk import (
     AsyncClient,
@@ -40,7 +43,7 @@ from cursor_sdk import (
     LocalAgentOptions,
     SendOptions,
 )
-from cursor_sdk.events import TextDeltaUpdate, ToolCallStartedUpdate
+from cursor_sdk.events import TextDeltaUpdate, ToolCallStartedUpdate, TurnEndedUpdate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,23 +110,86 @@ def workspace_dir() -> str:
 
 
 # ---------------------------------------------------------------------------
-# on_delta — live streaming to logs
+# token usage — accumulated from TurnEndedUpdate deltas
 # ---------------------------------------------------------------------------
 
 
-def on_delta(update) -> None:
-    try:
-        if isinstance(update, TextDeltaUpdate):
-            log.info("[stream] %s", update.text.rstrip())
-        elif isinstance(update, ToolCallStartedUpdate):
-            tool_name = (
-                update.tool_call.get("name")
-                or update.tool_call.get("toolName")
-                or update.call_id
-            )
-            log.info("[tool-start] %s", tool_name)
-    except Exception:
-        log.exception("Failed to handle SDK delta: %r", update)
+def _usage_int(usage: Mapping[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = usage.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+@dataclass
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    turns: int = 0
+
+    def add_turn(self, usage: Mapping[str, Any] | None) -> None:
+        if not usage:
+            return
+        self.turns += 1
+        self.input_tokens += _usage_int(usage, "inputTokens", "input_tokens")
+        self.output_tokens += _usage_int(usage, "outputTokens", "output_tokens")
+        self.cache_read_tokens += _usage_int(
+            usage, "cacheReadTokens", "cache_read_tokens"
+        )
+        self.cache_write_tokens += _usage_int(
+            usage, "cacheWriteTokens", "cache_write_tokens"
+        )
+
+    @property
+    def total_tokens(self) -> int:
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens
+        )
+
+    def log_summary(self) -> None:
+        if self.turns == 0:
+            log.info("=== Session token usage ===")
+            log.info("(no usage data received)")
+            return
+        log.info("=== Session token usage ===")
+        log.info("Turns:              %s", self.turns)
+        log.info("Input tokens:       %s", f"{self.input_tokens:,}")
+        log.info("Output tokens:      %s", f"{self.output_tokens:,}")
+        log.info("Cache read tokens:  %s", f"{self.cache_read_tokens:,}")
+        log.info("Cache write tokens: %s", f"{self.cache_write_tokens:,}")
+        log.info("Total tokens:       %s", f"{self.total_tokens:,}")
+
+
+def make_on_delta(usage: TokenUsage, *, stream: bool = False):
+    """Return an on_delta callback that accumulates usage and optionally logs."""
+
+    def on_delta(update) -> None:
+        try:
+            if isinstance(update, TurnEndedUpdate):
+                usage.add_turn(update.usage)
+            elif stream and isinstance(update, TextDeltaUpdate):
+                log.info("[stream] %s", update.text.rstrip())
+            elif stream and isinstance(update, ToolCallStartedUpdate):
+                tool_name = (
+                    update.tool_call.get("name")
+                    or update.tool_call.get("toolName")
+                    or update.call_id
+                )
+                log.info("[tool-start] %s", tool_name)
+        except Exception:
+            log.exception("Failed to handle SDK delta: %r", update)
+
+    return on_delta
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +357,7 @@ async def run_pipeline(ctx: dict) -> None:
     api_key = required_env("CURSOR_API_KEY")
     issue_prompt = build_issue_prompt(ctx)
     cwd = workspace_dir()
+    session_usage = TokenUsage()
 
     log.info("Repository  : %s", ctx["repository"])
     log.info("Workspace   : %s", cwd)
@@ -300,6 +367,19 @@ async def run_pipeline(ctx: dict) -> None:
     log.info("Model       : %s", ctx["model"])
     log.info("Max retries : %s", ctx["max_retries"])
 
+    try:
+        await _run_pipeline(ctx, api_key, issue_prompt, cwd, session_usage)
+    finally:
+        session_usage.log_summary()
+
+
+async def _run_pipeline(
+    ctx: dict,
+    api_key: str,
+    issue_prompt: str,
+    cwd: str,
+    session_usage: TokenUsage,
+) -> None:
     async with await AsyncClient.launch_bridge(workspace=cwd) as client:
         log.info("=== Phase 1/2: Planning (plan mode) ===")
         async with await client.agents.create(
@@ -315,7 +395,10 @@ async def run_pipeline(ctx: dict) -> None:
             try:
                 plan_run = await agent.send(
                     plan_prompt,
-                    SendOptions(mode="plan"),
+                    SendOptions(
+                        mode="plan",
+                        on_delta=make_on_delta(session_usage),
+                    ),
                 )
             except CursorAgentError as err:
                 log_sdk_error(err)
@@ -345,7 +428,10 @@ async def run_pipeline(ctx: dict) -> None:
             try:
                 impl_run = await agent.send(
                     agent_prompt,
-                    SendOptions(mode="agent", on_delta=on_delta),
+                    SendOptions(
+                        mode="agent",
+                        on_delta=make_on_delta(session_usage, stream=True),
+                    ),
                 )
             except CursorAgentError as err:
                 log_sdk_error(err)
