@@ -1,0 +1,131 @@
+name: Issue → PR Pipeline
+
+on:
+  issues:
+    types: [assigned]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to process"
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      pipeline_ref:
+        description: "Git ref of the pipeline scripts (match the @ref in uses:)"
+        required: false
+        type: string
+        default: main
+    secrets:
+      CURSOR_API_KEY:
+        required: true
+
+jobs:
+  plan-and-implement:
+    if: |
+      (github.event_name == 'workflow_dispatch') ||
+      (github.event.action == 'assigned' && github.event.assignee.login == 'gbo-dev')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Checkout pipeline scripts
+        if: github.repository != 'gbo-dev/cursor-sdk-cloud-agent'
+        uses: actions/checkout@v4
+        with:
+          repository: gbo-dev/cursor-sdk-cloud-agent
+          path: .pipeline
+          ref: ${{ inputs.pipeline_ref }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python and dependencies
+        run: |
+          uv python install 3.12
+          uv venv --python 3.12
+          uv pip install cursor-sdk
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Determine issue number
+        id: issue
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "number=${{ github.event.inputs.issue_number }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "number=${{ github.event.issue.number }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch issue details
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE_NUMBER="${{ steps.issue.outputs.number }}"
+          ISSUE_JSON=$(gh issue view "$ISSUE_NUMBER" --json title,body,labels --repo "${{ github.repository }}")
+
+          TITLE=$(echo "$ISSUE_JSON" | jq -r '.title')
+          BODY=$(echo "$ISSUE_JSON" | jq -r '.body // ""')
+          LABELS=$(echo "$ISSUE_JSON" | jq -r '[.labels[].name] | join(",")')
+
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "body<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$BODY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "labels=$LABELS" >> "$GITHUB_OUTPUT"
+
+          echo "Issue #${ISSUE_NUMBER}: ${TITLE}"
+
+      - name: Prepare git branch for agent
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ISSUE_NUMBER="${{ steps.issue.outputs.number }}"
+          BRANCH="issue-${ISSUE_NUMBER}-agent"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          echo "branch=$BRANCH" >> "$GITHUB_ENV"
+
+      - name: Run Issue → PR Pipeline
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ steps.issue.outputs.number }}
+          ISSUE_TITLE: ${{ steps.fetch.outputs.title }}
+          ISSUE_BODY: ${{ steps.fetch.outputs.body }}
+          ISSUE_LABELS: ${{ steps.fetch.outputs.labels }}
+          STARTING_REF: main
+          AGENT_BRANCH: ${{ env.branch }}
+          CURSOR_MODEL: composer-2.5
+        run: |
+          if [ -f .github/scripts/agent_runner.py ]; then
+            SCRIPT=.github/scripts/agent_runner.py
+          else
+            SCRIPT=.pipeline/.github/scripts/agent_runner.py
+          fi
+          python "$SCRIPT"
+
+      - name: Comment on issue
+        if: success() && github.event_name != 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue comment "${{ steps.issue.outputs.number }}" \
+            --repo "${{ github.repository }}" \
+            --body "Assigned to @${{ github.event.assignee.login }} — kicking off issue → PR pipeline. I'll plan a solution then implement it and open a PR."
