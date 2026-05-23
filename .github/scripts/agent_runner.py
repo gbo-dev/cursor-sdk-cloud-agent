@@ -49,7 +49,7 @@ from cursor_sdk import (
     LocalAgentOptions,
     SendOptions,
 )
-from cursor_sdk.events import TextDeltaUpdate, ToolCallStartedUpdate, TurnEndedUpdate
+from cursor_sdk.events import TurnEndedUpdate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -175,26 +175,54 @@ class TokenUsage:
         log.info("Total tokens:       %s", f"{self.total_tokens:,}")
 
 
-def make_on_delta(usage: TokenUsage, *, stream: bool = False):
-    """Return an on_delta callback that accumulates usage and optionally logs."""
+def make_on_delta(usage: TokenUsage):
+    """Return an on_delta callback that accumulates per-turn token usage."""
 
     def on_delta(update) -> None:
         try:
             if isinstance(update, TurnEndedUpdate):
                 usage.add_turn(update.usage)
-            elif stream and isinstance(update, TextDeltaUpdate):
-                log.info("[stream] %s", update.text.rstrip())
-            elif stream and isinstance(update, ToolCallStartedUpdate):
-                tool_name = (
-                    update.tool_call.get("name")
-                    or update.tool_call.get("toolName")
-                    or update.call_id
-                )
-                log.info("[tool-start] %s", tool_name)
         except Exception:
             log.exception("Failed to handle SDK delta: %r", update)
 
     return on_delta
+
+
+# Log assistant text in coarse chunks (per speech segment), not per token.
+_MAX_ASSISTANT_LOG_CHARS = 8000
+_ASSISTANT_FLUSH_STATUSES = frozenset(
+    {"FINISHED", "ERROR", "CANCELLED", "ABORTED", "FAILED"}
+)
+
+
+class _AssistantTextBuffer:
+    """Accumulate streaming assistant deltas; flush on segment boundaries."""
+
+    __slots__ = ("_parts",)
+
+    def __init__(self) -> None:
+        self._parts: list[str] = []
+
+    def append(self, text: str) -> None:
+        if text:
+            self._parts.append(text)
+
+    def flush(self) -> None:
+        if not self._parts:
+            return
+        text = "".join(self._parts)
+        self._parts.clear()
+        text = text.strip()
+        if not text:
+            return
+        if len(text) > _MAX_ASSISTANT_LOG_CHARS:
+            log.info(
+                "[assistant] %s... (%d chars total)",
+                text[:_MAX_ASSISTANT_LOG_CHARS],
+                len(text),
+            )
+        else:
+            log.info("[assistant] %s", text)
 
 
 # ---------------------------------------------------------------------------
@@ -336,18 +364,17 @@ Every PR you open must include:
 
 async def stream_run(run) -> None:
     """Consume the live message stream and log progress."""
+    assistant = _AssistantTextBuffer()
     async for msg in run.messages():
         if msg.type == "assistant":
             for block in msg.message.content:
-                if block.type == "text":
-                    text = block.text
-                    if len(text) > 500:
-                        log.info("[assistant] %s...", text[:500])
-                    else:
-                        log.info("[assistant] %s", text)
+                if block.type == "text" and block.text:
+                    assistant.append(block.text)
         elif msg.type == "thinking":
+            assistant.flush()
             log.debug("[thinking] %s", msg.text[:200])
         elif msg.type == "tool_call":
+            assistant.flush()
             log.info(
                 "[tool] %s  status=%s  args=%s",
                 msg.name,
@@ -355,7 +382,11 @@ async def stream_run(run) -> None:
                 str(msg.args)[:200] if msg.args else "",
             )
         elif msg.type == "status":
-            log.info("[status] %s: %s", msg.status, getattr(msg, "message", ""))
+            status = str(msg.status)
+            if status in _ASSISTANT_FLUSH_STATUSES:
+                assistant.flush()
+            log.info("[status] %s: %s", status, getattr(msg, "message", ""))
+    assistant.flush()
 
 
 async def run_pipeline(ctx: dict) -> None:
@@ -437,7 +468,7 @@ async def _run_pipeline(
                     agent_prompt,
                     SendOptions(
                         mode="agent",
-                        on_delta=make_on_delta(session_usage, stream=True),
+                        on_delta=make_on_delta(session_usage),
                     ),
                 )
             except CursorAgentError as err:
