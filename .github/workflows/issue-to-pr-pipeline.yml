@@ -113,6 +113,7 @@ jobs:
           STARTING_REF: main
           AGENT_BRANCH: ${{ env.branch }}
           CURSOR_MODEL: composer-2.5
+          CURSOR_MODEL_FAST: "false"
         run: |
           if [ -f .github/scripts/agent_runner.py ]; then
             SCRIPT=.github/scripts/agent_runner.py

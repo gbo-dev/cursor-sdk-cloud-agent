@@ -23,15 +23,21 @@ Environment variables (set by the workflow):
   STARTING_REF          — git ref checked out before the agent runs (default "main")
   MAX_RETRY_ATTEMPTS    — max test → fix retries in agent mode (default 3)
   CURSOR_MODEL          — model id (default "composer-2.5")
+  CURSOR_MODEL_FAST     — "false" for standard tier (workflow sets this)
   AGENT_BRANCH          — branch the agent should commit on (set by workflow)
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
-import logging
+from pathlib import Path
+
+# Allow imports when executed as a script from the repo root.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from model_config import build_model_selection, format_model
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -78,7 +84,6 @@ def load_ctx() -> dict:
         ],
         "starting_ref": os.getenv("STARTING_REF", "main"),
         "max_retries": int(os.getenv("MAX_RETRY_ATTEMPTS", "3")),
-        "model": os.getenv("CURSOR_MODEL", "composer-2.5"),
         "branch": os.getenv("AGENT_BRANCH", ""),
     }
 
@@ -364,11 +369,12 @@ async def run_pipeline(ctx: dict) -> None:
     log.info("Issue       : #%s — %s", ctx["issue_number"], ctx["title"])
     log.info("Branch      : %s", ctx["branch"] or "(agent chooses)")
     log.info("Base ref    : %s", ctx["starting_ref"])
-    log.info("Model       : %s", ctx["model"])
+    model = build_model_selection(api_key)
+    log.info("Model       : %s", format_model(model))
     log.info("Max retries : %s", ctx["max_retries"])
 
     try:
-        await _run_pipeline(ctx, api_key, issue_prompt, cwd, session_usage)
+        await _run_pipeline(ctx, api_key, model, issue_prompt, cwd, session_usage)
     finally:
         session_usage.log_summary()
 
@@ -376,6 +382,7 @@ async def run_pipeline(ctx: dict) -> None:
 async def _run_pipeline(
     ctx: dict,
     api_key: str,
+    model,
     issue_prompt: str,
     cwd: str,
     session_usage: TokenUsage,
@@ -384,7 +391,7 @@ async def _run_pipeline(
         log.info("=== Phase 1/2: Planning (plan mode) ===")
         async with await client.agents.create(
             AgentOptions(
-                model=ctx["model"],
+                model=model,
                 api_key=api_key,
                 local=LocalAgentOptions(cwd=cwd),
             ),

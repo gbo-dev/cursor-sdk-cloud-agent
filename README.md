@@ -35,6 +35,6 @@ jobs:
 
 Add `CURSOR_API_KEY` as a repo secret. Per the [Python SDK docs](https://cursor.com/docs/sdk/python), use a **user API key** from [Dashboard → Integrations](https://cursor.com/dashboard/integrations) or a **team service-account key** from [Team settings](https://cursor.com/dashboard/team-settings).
 
-The workflow checks out the consumer repo on the runner and runs a **local** SDK agent (`local=LocalAgentOptions(cwd=...)`). No Cursor cloud VM, no Max Mode cloud pricing, and no GitHub connection in the Cursor dashboard required for repo cloning — but the runner needs `contents: write` and `pull-requests: write` so the agent can push and open a PR.
+The workflow checks out the consumer repo on the runner and runs a **local** SDK agent (`local=LocalAgentOptions(cwd=...)`). The agent executes on the GitHub Actions machine against that checkout — it is not a Cursor-hosted cloud VM (`cloud=CloudAgentOptions(...)`). You still use Cursor’s **Composer model over the API**; “local” only describes where the process runs.
 
-Optional: set `CURSOR_MODEL` in the reusable workflow env (default `composer-2.5`).
+Optional env on the reusable workflow: `CURSOR_MODEL` (default `composer-2.5`), `CURSOR_MODEL_FAST` (default `"false"` for standard tier; set `"true"` for fast).
